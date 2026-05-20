@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.idea/
+.vscode/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+requirements.lock.txt

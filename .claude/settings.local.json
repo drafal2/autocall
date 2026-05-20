@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import QuantLib as ql; help\\(ql.NoExceptLocalVolSurface\\)\" 2>&1 | Select-Object -First 40)"
+    ]
+  }
+}

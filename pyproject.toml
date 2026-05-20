@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocall"
+version = "0.1.0"
+description = "Equity basket autocall pricer (Local Vol + Sobol/BB Monte Carlo)"
+requires-python = ">=3.11"
+dependencies = [
+    "QuantLib",
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
