@@ -79,7 +79,10 @@ class AutocallTerms:
         If ``True`` the guaranteed coupon for the redemption period is also paid
         on the redemption date.
     notional : float
-        Scaling base for interest / coupon amounts. Not exchanged.
+        Position size used to convert the per-unit price into a market value
+        (``market_value = notional * price``) and to express cashflows in
+        notional terms. It does **not** affect the per-unit price itself, and
+        no principal is exchanged.
     """
 
     autocall_barrier: float
@@ -141,11 +144,16 @@ class AutocallNote:
     audit : pandas.DataFrame
         Per-``(path, obs)`` cashflow record, populated after :meth:`price`.
     price_ : float
-        Monte Carlo price (mean of per-path discounted cashflows).
+        Monte Carlo price per unit notional (mean of per-path discounted
+        cashflows), i.e. a fraction / percentage of notional.
     stderr_ : float
         Monte Carlo standard error of :attr:`price_`.
+    market_value_ : float
+        Market value of the position, ``notional * price_``.
+    mv_stderr_ : float
+        Monte Carlo standard error of :attr:`market_value_`.
     path_pv_ : ndarray, shape (n_paths,)
-        Discounted cashflow sum for each path.
+        Discounted per-unit cashflow sum for each path.
     """
 
     def __init__(
@@ -167,6 +175,8 @@ class AutocallNote:
         self.audit: Optional[pd.DataFrame] = None
         self.price_: Optional[float] = None
         self.stderr_: Optional[float] = None
+        self.market_value_: Optional[float] = None
+        self.mv_stderr_: Optional[float] = None
         self.path_pv_: Optional[np.ndarray] = None
 
         self._validate()
@@ -280,14 +290,14 @@ class AutocallNote:
             redeem_idx[newly] = j
             redeemed_any |= newly
 
-            # Early-redemption interest (interest only -- no notional exchange)
+            # Early-redemption interest, per unit notional (no principal exchange)
             er = t.early_redemption_rate * k if t.snowball else t.early_redemption_rate
-            interest_store[newly, j] = t.notional * er
+            interest_store[newly, j] = er
 
             # Guaranteed coupon -- per-period mode is paid here
             if not t.coupon_digital:
                 pay_mask = alive & (~newly | t.coupon_on_redemption)
-                coupon_store[pay_mask, j] = t.notional * t.guaranteed_coupon
+                coupon_store[pay_mask, j] = t.guaranteed_coupon
 
             alive &= ~newly
 
@@ -302,7 +312,7 @@ class AutocallNote:
                 credited = np.where(redeemed_any, term_k - 1, term_k)
             credited = np.clip(credited, 0, None)
             coupon_store[np.arange(n_paths), term_col] += (
-                t.notional * t.guaranteed_coupon * credited
+                t.guaranteed_coupon * credited
             )
 
         cashflow_store = coupon_store + interest_store
@@ -314,6 +324,10 @@ class AutocallNote:
         self.path_pv_ = discounted.sum(axis=1)
         self.price_ = float(self.path_pv_.mean())
         self.stderr_ = float(self.path_pv_.std(ddof=1) / np.sqrt(n_paths))
+
+        # Market value scales the per-unit price by the notional position size.
+        self.market_value_ = self.price_ * t.notional
+        self.mv_stderr_ = self.stderr_ * t.notional
 
         self._build_audit(
             perf_store, metric_store, redeemed_store, coupon_store,
@@ -332,6 +346,7 @@ class AutocallNote:
         index = pd.MultiIndex.from_product(
             [range(n_paths), range(n_obs)], names=["path", "obs"]
         )
+        notional = self.terms.notional
         data = {f"perf_{a}": perf[:, :, a].reshape(-1) for a in range(n_assets)}
         data.update(
             basket_metric=metric.reshape(-1),
@@ -341,6 +356,8 @@ class AutocallNote:
             cashflow=cashflow.reshape(-1),
             discount_factor=np.broadcast_to(dfs, (n_paths, n_obs)).reshape(-1),
             discounted_cf=discounted.reshape(-1),
+            cashflow_notional=(cashflow * notional).reshape(-1),
+            discounted_cf_notional=(discounted * notional).reshape(-1),
         )
         df = pd.DataFrame(data, index=index)
         df.insert(0, "date", np.tile(obs_dates, n_paths))
@@ -359,6 +376,8 @@ class AutocallNote:
             mean_cashflow=("cashflow", "mean"),
             discount_factor=("discount_factor", "first"),
             mean_discounted_cf=("discounted_cf", "mean"),
+            mean_cashflow_notional=("cashflow_notional", "mean"),
+            mean_discounted_cf_notional=("discounted_cf_notional", "mean"),
         )
         return out
 
@@ -369,6 +388,9 @@ class AutocallNote:
         return {
             "price": self.price_,
             "stderr": self.stderr_,
+            "notional": self.terms.notional,
+            "market_value": self.market_value_,
+            "mv_stderr": self.mv_stderr_,
             "n_paths": self.paths.shape[0],
             "redemption_prob_total": float(
                 self.audit.groupby("path")["redeemed"].any().mean()
