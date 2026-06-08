@@ -134,10 +134,17 @@ class AutocallNote:
     path_dates : sequence of ql.Date, length n_cols
         Calendar date attached to each path column (including the valuation date).
     schedule : sequence of ql.Date
-        Observation / payment dates. Must be a subset of ``path_dates`` and must
-        not coincide with the valuation-date column.
+        Observation dates on which performance is fixed and redemption is
+        tested. Must be a subset of ``path_dates`` and must not coincide with
+        the valuation-date column.
     discount_curve : ql.YieldTermStructureHandle
         Curve used to discount cashflows via ``discount_curve.discount(date)``.
+    payment_dates : sequence of ql.Date, optional
+        Date on which the cashflow for each observation is actually paid and
+        discounted. Same length as ``schedule`` and aligned to it; each payment
+        date must be on or after its observation date. They need not be path
+        columns (no fixing is read there). Defaults to ``schedule`` (pay on the
+        observation date).
 
     Attributes
     ----------
@@ -164,6 +171,7 @@ class AutocallNote:
         path_dates: Sequence[ql.Date],
         schedule: Sequence[ql.Date],
         discount_curve: ql.YieldTermStructureHandle,
+        payment_dates: Optional[Sequence[ql.Date]] = None,
     ) -> None:
         self.terms = terms
         self.initial_fixings = np.asarray(initial_fixings, dtype=float)
@@ -171,6 +179,10 @@ class AutocallNote:
         self.path_dates = list(path_dates)
         self.schedule = list(schedule)
         self.discount_curve = discount_curve
+        # Default: pay each cashflow on its own observation date.
+        self.payment_dates = (
+            list(schedule) if payment_dates is None else list(payment_dates)
+        )
 
         self.audit: Optional[pd.DataFrame] = None
         self.price_: Optional[float] = None
@@ -218,6 +230,23 @@ class AutocallNote:
         if any(c == 0 for c in self.obs_cols):
             raise ValueError("an observation date coincides with the valuation-date column")
 
+        # Payment dates are aligned 1-to-1 with observation dates and must not
+        # fall before the observation they settle.
+        if len(self.payment_dates) != len(self.schedule):
+            raise ValueError(
+                f"payment_dates length {len(self.payment_dates)} != schedule "
+                f"length {len(self.schedule)}"
+            )
+        early = [
+            (_ql_to_pydate(p), _ql_to_pydate(o))
+            for p, o in zip(self.payment_dates, self.schedule)
+            if p.serialNumber() < o.serialNumber()
+        ]
+        if early:
+            raise ValueError(
+                f"payment dates precede their observation dates: {early}"
+            )
+
         if self.terms.basket_mode is BasketMode.MULTIPERFORMANCE:
             w = np.asarray(self.terms.weights, dtype=float)
             if w.shape != (n_assets,):
@@ -264,6 +293,7 @@ class AutocallNote:
 
         perf_store = np.zeros((n_paths, n_obs, n_assets))
         metric_store = np.zeros((n_paths, n_obs))
+        basket_perf_store = np.zeros((n_paths, n_obs))
         redeemed_store = np.zeros((n_paths, n_obs), dtype=bool)
         coupon_store = np.zeros((n_paths, n_obs))
         interest_store = np.zeros((n_paths, n_obs))
@@ -276,8 +306,13 @@ class AutocallNote:
             perf = self.paths[:, :, col] / self.initial_fixings
             perf_store[:, j, :] = perf
 
+            # Aggregated basket performance is reported for every redemption
+            # type (for memory-on-KO ``metric_store`` instead holds the breach
+            # count, so we keep the performance separately).
+            basket_perf_store[:, j] = self._basket_metric(perf)
+
             if t.redemption_type is RedemptionType.USUAL:
-                metric = self._basket_metric(perf)
+                metric = basket_perf_store[:, j]
                 metric_store[:, j] = metric
                 trigger = self._usual_trigger(metric)
             else:  # memory-on-KO
@@ -316,8 +351,10 @@ class AutocallNote:
             )
 
         cashflow_store = coupon_store + interest_store
+        # Discount each cashflow at its payment date (which may differ from the
+        # observation date that fixed it).
         dfs = np.array(
-            [self.discount_curve.discount(self.path_dates[c]) for c in self.obs_cols]
+            [self.discount_curve.discount(p) for p in self.payment_dates]
         )
         discounted = cashflow_store * dfs[None, :]
 
@@ -330,18 +367,20 @@ class AutocallNote:
         self.mv_stderr_ = self.stderr_ * t.notional
 
         self._build_audit(
-            perf_store, metric_store, redeemed_store, coupon_store,
-            interest_store, cashflow_store, discounted, dfs,
+            perf_store, metric_store, basket_perf_store, redeemed_store,
+            coupon_store, interest_store, cashflow_store, discounted, dfs,
         )
         return self.price_
 
     # --------------------------------------------------------------- reports
     def _build_audit(
         self,
-        perf, metric, redeemed, coupon, interest, cashflow, discounted, dfs,
+        perf, metric, basket_perf, redeemed, coupon, interest, cashflow,
+        discounted, dfs,
     ) -> None:
         n_paths, n_obs, n_assets = perf.shape
         obs_dates = [_ql_to_pydate(self.path_dates[c]) for c in self.obs_cols]
+        pay_dates = [_ql_to_pydate(p) for p in self.payment_dates]
 
         index = pd.MultiIndex.from_product(
             [range(n_paths), range(n_obs)], names=["path", "obs"]
@@ -350,6 +389,7 @@ class AutocallNote:
         data = {f"perf_{a}": perf[:, :, a].reshape(-1) for a in range(n_assets)}
         data.update(
             basket_metric=metric.reshape(-1),
+            basket_performance=basket_perf.reshape(-1),
             redeemed=redeemed.reshape(-1),
             coupon=coupon.reshape(-1),
             redemption_interest=interest.reshape(-1),
@@ -361,25 +401,69 @@ class AutocallNote:
         )
         df = pd.DataFrame(data, index=index)
         df.insert(0, "date", np.tile(obs_dates, n_paths))
+        df.insert(1, "payment_date", np.tile(pay_dates, n_paths))
         self.audit = df
 
     def expected_cashflows(self) -> pd.DataFrame:
-        """Mean (undiscounted and discounted) cashflow per observation date."""
+        """Per-observation cashflow profile.
+
+        For each observation date the table reports the expected (mean) basket
+        performance, the probability of redeeming on that date, and the
+        *contingent* cashflows in notional terms — i.e. the amounts that would
+        be paid *if* the relevant event occurred, not their probability-weighted
+        expectation:
+
+        ``expected_performance``
+            Mean aggregated basket performance across paths on the observation
+            date.
+        ``ko_coupon_notional``
+            Possible cashflow from equity performance: the early-redemption
+            ("knock-out") coupon ``early_redemption_rate * notional`` paid if
+            the note redeems on this date, including the snowball multiplier
+            ``* k`` when :attr:`AutocallTerms.snowball` is set.
+        ``guaranteed_coupon_notional``
+            Possible cashflow from the guaranteed interest rate,
+            ``guaranteed_coupon * notional`` (the accumulated lump ``* k`` for a
+            digital coupon).
+        ``payment_date``
+            Date on which that observation's cashflow settles / is discounted.
+
+        ``expected_discounted_cf_notional`` (the probability-weighted, discounted
+        mean cashflow in notional terms) is also included; summing it over
+        observations reconciles to :attr:`market_value_`.
+        """
         if self.audit is None:
             raise RuntimeError("call price() first")
-        grouped = self.audit.groupby("obs")
-        out = grouped.agg(
+        t = self.terms
+        notional = t.notional
+
+        out = self.audit.groupby("obs").agg(
             date=("date", "first"),
+            payment_date=("payment_date", "first"),
+            expected_performance=("basket_performance", "mean"),
             redemption_prob=("redeemed", "mean"),
-            mean_coupon=("coupon", "mean"),
-            mean_interest=("redemption_interest", "mean"),
-            mean_cashflow=("cashflow", "mean"),
             discount_factor=("discount_factor", "first"),
-            mean_discounted_cf=("discounted_cf", "mean"),
-            mean_cashflow_notional=("cashflow_notional", "mean"),
-            mean_discounted_cf_notional=("discounted_cf_notional", "mean"),
+            expected_discounted_cf_notional=("discounted_cf_notional", "mean"),
         )
-        return out
+
+        # Contingent (per-period, 1-based) coupon amounts. These are
+        # deterministic given the term sheet, so they come from terms, not paths.
+        k = np.arange(1, len(out) + 1)
+        er = t.early_redemption_rate * k if t.snowball else np.full(len(out), t.early_redemption_rate)
+        gc = t.guaranteed_coupon * k if t.coupon_digital else np.full(len(out), t.guaranteed_coupon)
+        out["ko_coupon_notional"] = er * notional
+        out["guaranteed_coupon_notional"] = gc * notional
+
+        return out[[
+            "date",
+            "payment_date",
+            "expected_performance",
+            "redemption_prob",
+            "ko_coupon_notional",
+            "guaranteed_coupon_notional",
+            "discount_factor",
+            "expected_discounted_cf_notional",
+        ]]
 
     def summary(self) -> dict:
         """Headline pricing results."""
